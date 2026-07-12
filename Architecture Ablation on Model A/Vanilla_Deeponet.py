@@ -1,0 +1,489 @@
+# %% Cell 1
+import os
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+
+if torch.cuda.is_available():
+    cap = torch.cuda.get_device_capability(0)
+    device = torch.device("cuda") if cap[0] >= 7 else torch.device("cpu")
+else:
+    device = torch.device("cpu")
+print(device)
+
+# %% Cell 2
+
+def find_dataset_root(base="/kaggle/input"):
+    for dirpath, dirnames, filenames in os.walk(base):
+        if "manifest.csv" in filenames:
+            return dirpath
+    raise FileNotFoundError("manifest.csv not found under " + base)
+
+DATA_ROOT = find_dataset_root()
+manifest = pd.read_csv(os.path.join(DATA_ROOT, "manifest.csv"))
+
+file_index = {}
+for root, dirs, files in os.walk(DATA_ROOT):
+    for f in files:
+        if f.endswith(".npz"):
+            file_index[f] = os.path.join(root, f)
+
+manifest["basename"] = manifest["path"].apply(os.path.basename)
+manifest["resolved_path"] = manifest["basename"].map(file_index)
+resolved = manifest[manifest["resolved_path"].notna()].copy()
+print(resolved.shape)
+print(resolved["class"].value_counts())
+
+# %% Cell 3
+
+RES = 64
+
+def load_resized(arr, res):
+    t = torch.tensor(arr, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+    t = F.interpolate(t, size=(res, res), mode="bilinear", align_corners=False)
+    return t.squeeze(0).squeeze(0)
+
+def downsample_tensor(t, res):
+    t = t.unsqueeze(0).unsqueeze(0)
+    t = F.interpolate(t, size=(res, res), mode="bilinear", align_corners=False)
+    return t.squeeze(0).squeeze(0)
+
+def compute_alpha_from_psi(psi):
+    grad_y, grad_x = torch.gradient(psi, dim=(0, 1))
+    return grad_x, grad_y
+
+def make_base_grid(B, H, W, device):
+    theta = torch.eye(2, 3, device=device).unsqueeze(0).repeat(B, 1, 1)
+    grid = F.affine_grid(theta, size=(B, 1, H, W), align_corners=False)
+    return grid
+
+def warp_source(source_norm, alpha_raw):
+    B, H, W = source_norm.shape
+    base_grid = make_base_grid(B, H, W, source_norm.device)
+    scale = 2.0 / W
+    alpha_grid = torch.stack([alpha_raw[:, 0], alpha_raw[:, 1]], dim=-1) * scale
+    sample_grid = base_grid - alpha_grid
+    warped = F.grid_sample(source_norm.unsqueeze(1), sample_grid, mode="bilinear",
+                            padding_mode="zeros", align_corners=False)
+    return warped.squeeze(1)
+
+def normalize(x, mean, std):
+    return (x - mean) / std
+
+def denormalize(x, mean, std):
+    return x * std + mean
+
+def rel_l2_np(pred, target):
+    diff = np.linalg.norm(pred.flatten() - target.flatten())
+    norm = np.linalg.norm(target.flatten()) + 1e-8
+    return diff / norm
+
+calib_sample = resolved.sample(20, random_state=0)
+candidate_multipliers = np.logspace(-1.5, 1.5, 25)
+scores = {m: [] for m in candidate_multipliers}
+
+for _, row in calib_sample.iterrows():
+    d = np.load(row["resolved_path"])
+    source_r = load_resized(d["unlensed"][0], RES).numpy()
+    image_r = load_resized(d["image"][0], RES).numpy()
+    psi_native = torch.tensor(d["psi"], dtype=torch.float32)
+    ax_native, ay_native = compute_alpha_from_psi(psi_native)
+    ax_base = downsample_tensor(ax_native, RES)
+    ay_base = downsample_tensor(ay_native, RES)
+    source_t = torch.tensor(source_r).unsqueeze(0)
+    for m in candidate_multipliers:
+        alpha_t = torch.stack([ax_base * m, ay_base * m], dim=0).unsqueeze(0)
+        with torch.no_grad():
+            warped = warp_source(source_t, alpha_t)
+        scores[m].append(rel_l2_np(warped[0].numpy(), image_r))
+
+avg_scores = {m: np.mean(v) for m, v in scores.items()}
+ALPHA_SCALE_CALIBRATED = min(avg_scores, key=avg_scores.get)
+print("Selected ALPHA_SCALE_CALIBRATED =", ALPHA_SCALE_CALIBRATED)
+
+def load_raw_channels(df, res=RES):
+    kappas, sources, images, alphas_x, alphas_y = [], [], [], [], []
+    for p in df["resolved_path"]:
+        d = np.load(p)
+        kappa_r = load_resized(d["kappa"], res)
+        source_r = load_resized(d["unlensed"][0], res)
+        image_r = load_resized(d["image"][0], res)
+        psi_native = torch.tensor(d["psi"], dtype=torch.float32)
+        ax_native, ay_native = compute_alpha_from_psi(psi_native)
+        ax_r = downsample_tensor(ax_native, res) * ALPHA_SCALE_CALIBRATED
+        ay_r = downsample_tensor(ay_native, res) * ALPHA_SCALE_CALIBRATED
+        kappas.append(kappa_r)
+        sources.append(source_r)
+        images.append(image_r)
+        alphas_x.append(ax_r)
+        alphas_y.append(ay_r)
+    return (torch.stack(kappas), torch.stack(sources), torch.stack(images),
+            torch.stack(alphas_x), torch.stack(alphas_y))
+
+# %% Cell 4
+
+wdm_df = resolved[resolved["class"] == "wdm"].reset_index(drop=True)
+print(wdm_df["split"].value_counts())
+
+wdm_all = wdm_df[wdm_df["split"].isin(["val", "test"])].reset_index(drop=True)
+wdm_all = wdm_all.sample(frac=1, random_state=0).reset_index(drop=True)
+
+wdm_train_df = wdm_all.iloc[:3500].reset_index(drop=True)
+wdm_test_df = wdm_all.iloc[3500:4000].reset_index(drop=True)
+
+kappa_tr, source_tr, image_tr, ax_tr, ay_tr = load_raw_channels(wdm_train_df)
+kappa_te, source_te, image_te, ax_te, ay_te = load_raw_channels(wdm_test_df)
+
+kappa_mean, kappa_std = kappa_tr.mean(), kappa_tr.std() + 1e-8
+image_mean, image_std = image_tr.mean(), image_tr.std() + 1e-8
+source_mean, source_std = image_mean, image_std
+alpha_x_mean, alpha_x_std = ax_tr.mean(), ax_tr.std() + 1e-8
+alpha_y_mean, alpha_y_std = ay_tr.mean(), ay_tr.std() + 1e-8
+
+print("kappa:", kappa_mean.item(), kappa_std.item())
+print("shared source/image scale:", image_mean.item(), image_std.item())
+print("alpha_x:", alpha_x_mean.item(), alpha_x_std.item())
+print("alpha_y:", alpha_y_mean.item(), alpha_y_std.item())
+
+def build_tensor_dataset(kappa, source, image, ax, ay):
+    k = normalize(kappa, kappa_mean, kappa_std).unsqueeze(1)
+    s = normalize(source, source_mean, source_std)
+    i = normalize(image, image_mean, image_std)
+    alpha_true = torch.stack([ax, ay], dim=1)
+    return k, s, i, alpha_true
+
+K_train, S_train, I_train, A_train = build_tensor_dataset(kappa_tr, source_tr, image_tr, ax_tr, ay_tr)
+K_test, S_test, I_test, A_test = build_tensor_dataset(kappa_te, source_te, image_te, ax_te, ay_te)
+K_val, S_val, I_val, A_val = K_test, S_test, I_test, A_test
+
+print(K_train.shape, S_train.shape, I_train.shape, A_train.shape)
+
+train_loader = torch.utils.data.DataLoader(
+    torch.utils.data.TensorDataset(K_train, S_train, I_train, A_train), batch_size=64, shuffle=True)
+val_loader = torch.utils.data.DataLoader(
+    torch.utils.data.TensorDataset(K_val, S_val, I_val, A_val), batch_size=64, shuffle=False)
+test_loader = torch.utils.data.DataLoader(
+    torch.utils.data.TensorDataset(K_test, S_test, I_test, A_test), batch_size=64, shuffle=False)
+
+# %% Cell 5
+
+class VanillaDeepONet(nn.Module):
+    """
+    Vanilla DeepONet with one branch/trunk pair per output channel
+    (the standard way to get multiple outputs from a DeepONet).
+
+    Branch net: takes the input function sampled at fixed sensor points
+                (here, all H*W pixels of kappa) -> latent vector of size p.
+    Trunk net:  takes query coordinates (x,y) -> latent vector of size p.
+    Output at each query point = dot(branch_latent, trunk_latent) + bias,
+    for each output channel independently.
+    """
+    def __init__(self, res=64, out_channels=3, p=128, branch_hidden=256, trunk_hidden=128):
+        super().__init__()
+        self.res = res
+        self.out_channels = out_channels
+        self.p = p
+
+        n_sensors = res * res
+        self.branch = nn.Sequential(
+            nn.Linear(n_sensors, branch_hidden), nn.GELU(),
+            nn.Linear(branch_hidden, branch_hidden), nn.GELU(),
+            nn.Linear(branch_hidden, out_channels * p)
+        )
+
+        self.trunk = nn.Sequential(
+            nn.Linear(2, trunk_hidden), nn.GELU(),
+            nn.Linear(trunk_hidden, trunk_hidden), nn.GELU(),
+            nn.Linear(trunk_hidden, out_channels * p), nn.GELU()
+        )
+
+        self.bias = nn.Parameter(torch.zeros(out_channels))
+
+        ys, xs = torch.meshgrid(torch.linspace(-1, 1, res), torch.linspace(-1, 1, res), indexing="ij")
+        coords = torch.stack([ys.flatten(), xs.flatten()], dim=-1)  # (N, 2)
+        self.register_buffer("coords", coords)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x_flat = x.reshape(B, -1)  # (B, n_sensors)
+
+        branch_out = self.branch(x_flat)  # (B, out_channels*p)
+        branch_out = branch_out.view(B, self.out_channels, self.p)
+
+        trunk_out = self.trunk(self.coords)  # (N, out_channels*p)
+        N = trunk_out.shape[0]
+        trunk_out = trunk_out.view(N, self.out_channels, self.p)
+
+        # out[b, c, n] = sum_p branch[b,c,p] * trunk[n,c,p] + bias[c]
+        out = torch.einsum("bcp,ncp->bcn", branch_out, trunk_out)
+        out = out + self.bias.view(1, -1, 1)
+        out = out.view(B, self.out_channels, H, W)
+        return out
+
+class LearnablePSFBlur(nn.Module):
+    def __init__(self, kernel_size=9, init_sigma=1.0):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.log_sigma = nn.Parameter(torch.tensor(float(np.log(init_sigma))))
+    def forward(self, x):
+        sigma = torch.exp(self.log_sigma).clamp(min=0.05, max=5.0)
+        k = self.kernel_size
+        coords = torch.arange(k, device=x.device, dtype=x.dtype) - (k - 1) / 2
+        g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+        g = g / g.sum()
+        kernel_2d = (g[:, None] * g[None, :]).view(1, 1, k, k)
+        blurred = F.conv2d(x.unsqueeze(1), kernel_2d, padding=k // 2)
+        return blurred.squeeze(1)
+
+model = VanillaDeepONet(res=RES, out_channels=3, p=128, branch_hidden=256, trunk_hidden=128).to(device)
+psf_blur = LearnablePSFBlur(kernel_size=9, init_sigma=1.0).to(device)
+print("DeepONet params:", sum(p.numel() for p in model.parameters()))
+print("PSF params:", sum(p.numel() for p in psf_blur.parameters()))
+
+LENS_LIGHT_L2_WEIGHT = 1e-3
+
+def rel_l2_loss(pred, target):
+    B = pred.shape[0]
+    diff = torch.norm(pred.reshape(B, -1) - target.reshape(B, -1), dim=1)
+    norm = torch.norm(target.reshape(B, -1), dim=1) + 1e-8
+    return (diff / norm).mean()
+
+def compute_losses(model, psf_blur, kb, sb, ib, ab, image_weight=1.0, alpha_weight=1.0):
+    raw_out = model(kb)
+    alpha_pred_norm = raw_out[:, 0:2]
+    lens_light_pred = raw_out[:, 2]
+
+    ax_pred = alpha_pred_norm[:, 0] * alpha_x_std + alpha_x_mean
+    ay_pred = alpha_pred_norm[:, 1] * alpha_y_std + alpha_y_mean
+    alpha_pred_raw = torch.stack([ax_pred, ay_pred], dim=1)
+
+    warped = warp_source(sb, alpha_pred_raw)
+    combined = warped + lens_light_pred
+    pred_image = psf_blur(combined)
+
+    image_loss = rel_l2_loss(pred_image.unsqueeze(1), ib.unsqueeze(1))
+
+    ax_true_norm = (ab[:, 0] - alpha_x_mean) / alpha_x_std
+    ay_true_norm = (ab[:, 1] - alpha_y_mean) / alpha_y_std
+    alpha_true_norm = torch.stack([ax_true_norm, ay_true_norm], dim=1)
+    alpha_loss = F.mse_loss(alpha_pred_norm, alpha_true_norm)
+
+    lens_light_reg = (lens_light_pred ** 2).mean()
+
+    total = image_weight * image_loss + alpha_weight * alpha_loss + LENS_LIGHT_L2_WEIGHT * lens_light_reg
+    return total, image_loss, alpha_loss, pred_image, alpha_pred_raw, lens_light_pred
+
+optimizer = torch.optim.Adam(
+    list(model.parameters()) + list(psf_blur.parameters()),
+    lr=1e-3, weight_decay=1e-5
+)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.5)
+
+EPOCHS = 200
+PATIENCE = 20
+WARMUP_EPOCHS = 15
+
+best_val = float("inf")
+patience_ctr = 0
+
+# %% Cell 6
+
+for epoch in range(EPOCHS):
+    image_weight = min(1.0, epoch / WARMUP_EPOCHS)
+    alpha_weight = 5.0
+
+    model.train()
+    psf_blur.train()
+    tot_img, tot_alpha = 0, 0
+    for kb, sb, ib, ab in train_loader:
+        kb, sb, ib, ab = kb.to(device), sb.to(device), ib.to(device), ab.to(device)
+        optimizer.zero_grad()
+        loss, image_loss, alpha_loss, _, _, _ = compute_losses(
+            model, psf_blur, kb, sb, ib, ab, image_weight=image_weight, alpha_weight=alpha_weight)
+        loss.backward()
+        optimizer.step()
+        tot_img += image_loss.item() * kb.size(0)
+        tot_alpha += alpha_loss.item() * kb.size(0)
+    train_img = tot_img / len(K_train)
+    train_alpha = tot_alpha / len(K_train)
+    scheduler.step()
+
+    model.eval()
+    psf_blur.eval()
+    vtot_img, vtot_alpha = 0, 0
+    with torch.no_grad():
+        for kb, sb, ib, ab in val_loader:
+            kb, sb, ib, ab = kb.to(device), sb.to(device), ib.to(device), ab.to(device)
+            loss, image_loss, alpha_loss, _, _, _ = compute_losses(
+                model, psf_blur, kb, sb, ib, ab, image_weight=1.0, alpha_weight=alpha_weight)
+            vtot_img += image_loss.item() * kb.size(0)
+            vtot_alpha += alpha_loss.item() * kb.size(0)
+    val_img = vtot_img / len(K_val)
+    val_alpha = vtot_alpha / len(K_val)
+
+    current_sigma = torch.exp(psf_blur.log_sigma).item()
+    print(f"epoch {epoch:3d} | img_w {image_weight:.2f} | sigma {current_sigma:.3f} | "
+          f"train (img {train_img:.4f}, alpha {train_alpha:.4f}) "
+          f"| val (img {val_img:.4f}, alpha {val_alpha:.4f})")
+
+    if epoch >= WARMUP_EPOCHS:
+        if val_img < best_val:
+            best_val = val_img
+            patience_ctr = 0
+            torch.save({"model": model.state_dict(), "psf_blur": psf_blur.state_dict()}, "best_deeponet.pt")
+        else:
+            patience_ctr += 1
+            if patience_ctr >= PATIENCE:
+                print("early stopping at epoch", epoch)
+                break
+
+# %% Cell 7
+
+ckpt = torch.load("best_deeponet.pt")
+model.load_state_dict(ckpt["model"])
+psf_blur.load_state_dict(ckpt["psf_blur"])
+model.eval()
+psf_blur.eval()
+
+test_img, test_alpha = 0, 0
+with torch.no_grad():
+    for kb, sb, ib, ab in test_loader:
+        kb, sb, ib, ab = kb.to(device), sb.to(device), ib.to(device), ab.to(device)
+        _, image_loss, alpha_loss, _, _, _ = compute_losses(model, psf_blur, kb, sb, ib, ab, alpha_weight=5.0)
+        test_img += image_loss.item() * kb.size(0)
+        test_alpha += alpha_loss.item() * kb.size(0)
+test_img /= len(K_test); test_alpha /= len(K_test)
+print("WDM test | Vanilla DeepONet image rel_l2:", test_img, "| alpha rel_l2:", test_alpha)
+
+sample_indices = [0, 100, 300]
+for idx in sample_indices:
+    kb = K_test[idx:idx+1].to(device)
+    sb = S_test[idx:idx+1].to(device)
+    ib = I_test[idx:idx+1].to(device)
+    ab = A_test[idx:idx+1].to(device)
+    with torch.no_grad():
+        _, _, _, pred_image, alpha_pred, lens_light_pred = compute_losses(model, psf_blur, kb, sb, ib, ab, alpha_weight=5.0)
+
+    img_true = denormalize(ib[0].cpu(), image_mean, image_std).numpy()
+    img_pred = denormalize(pred_image[0].cpu(), image_mean, image_std).numpy()
+    lens_light_vis = lens_light_pred[0].cpu().numpy() * image_std.item()
+    ax_true, ay_true = ab[0, 0].cpu().numpy(), ab[0, 1].cpu().numpy()
+    ax_pred, ay_pred = alpha_pred[0, 0].cpu().numpy(), alpha_pred[0, 1].cpu().numpy()
+
+    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+    axes[0, 0].imshow(img_true, cmap="viridis"); axes[0, 0].set_title(f"true image (idx {idx})")
+    axes[0, 1].imshow(img_pred, cmap="viridis"); axes[0, 1].set_title("predicted (DeepONet + PSF)")
+    axes[0, 2].imshow(img_true - img_pred, cmap="coolwarm"); axes[0, 2].set_title("image error")
+    axes[0, 3].imshow(lens_light_vis, cmap="magma"); axes[0, 3].set_title("learned lens-light")
+    axes[1, 0].imshow(ax_true, cmap="coolwarm"); axes[1, 0].set_title("true alpha_x")
+    axes[1, 1].imshow(ax_pred, cmap="coolwarm"); axes[1, 1].set_title("pred alpha_x")
+    axes[1, 2].imshow(ay_true, cmap="coolwarm"); axes[1, 2].set_title("true alpha_y")
+    axes[1, 3].imshow(ay_pred, cmap="coolwarm"); axes[1, 3].set_title("pred alpha_y")
+    plt.tight_layout()
+    plt.show()
+
+# %% Cell 8
+
+cdm_df = resolved[resolved["class"] == "cdm"].reset_index(drop=True)
+cdm_all = cdm_df[cdm_df["split"].isin(["val", "test"])].reset_index(drop=True)
+cdm_all = cdm_all.sample(frac=1, random_state=0).reset_index(drop=True)
+cdm_zero_shot = cdm_all.iloc[:500].reset_index(drop=True)
+
+kappa_cdm, source_cdm, image_cdm, ax_cdm, ay_cdm = load_raw_channels(cdm_zero_shot)
+K_cdm, S_cdm, I_cdm, A_cdm = build_tensor_dataset(kappa_cdm, source_cdm, image_cdm, ax_cdm, ay_cdm)
+print(K_cdm.shape, I_cdm.shape)
+
+cdm_loader = torch.utils.data.DataLoader(
+    torch.utils.data.TensorDataset(K_cdm, S_cdm, I_cdm, A_cdm), batch_size=64, shuffle=False)
+
+ckpt = torch.load("best_deeponet.pt")
+model.load_state_dict(ckpt["model"])
+psf_blur.load_state_dict(ckpt["psf_blur"])
+model.eval()
+psf_blur.eval()
+
+cdm_img, cdm_alpha = 0, 0
+with torch.no_grad():
+    for kb, sb, ib, ab in cdm_loader:
+        kb, sb, ib, ab = kb.to(device), sb.to(device), ib.to(device), ab.to(device)
+        _, image_loss, alpha_loss, _, _, _ = compute_losses(model, psf_blur, kb, sb, ib, ab, alpha_weight=5.0)
+        cdm_img += image_loss.item() * kb.size(0)
+        cdm_alpha += alpha_loss.item() * kb.size(0)
+cdm_img /= len(K_cdm); cdm_alpha /= len(K_cdm)
+
+print("WDM-trained model, zero-shot CDM | image rel_l2:", cdm_img, "| alpha rel_l2:", cdm_alpha)
+print("WDM-trained model, in-distribution WDM image rel_l2:", test_img)
+
+sample_indices = [0, 100, 300]
+for idx in sample_indices:
+    kb = K_cdm[idx:idx+1].to(device)
+    sb = S_cdm[idx:idx+1].to(device)
+    ib = I_cdm[idx:idx+1].to(device)
+    ab = A_cdm[idx:idx+1].to(device)
+    with torch.no_grad():
+        _, _, _, pred_image, alpha_pred, lens_light_pred = compute_losses(model, psf_blur, kb, sb, ib, ab, alpha_weight=5.0)
+
+    img_true = denormalize(ib[0].cpu(), image_mean, image_std).numpy()
+    img_pred = denormalize(pred_image[0].cpu(), image_mean, image_std).numpy()
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    axes[0].imshow(img_true, cmap="viridis"); axes[0].set_title(f"CDM true image (idx {idx})")
+    axes[1].imshow(img_pred, cmap="viridis"); axes[1].set_title("CDM predicted image")
+    axes[2].imshow(img_true - img_pred, cmap="coolwarm"); axes[2].set_title("CDM image error")
+    plt.tight_layout()
+    plt.show()
+
+# %% Cell 9
+
+axion_df = resolved[resolved["class"] == "axion"].reset_index(drop=True)
+axion_all = axion_df[axion_df["split"].isin(["val", "test"])].reset_index(drop=True)
+axion_all = axion_all.sample(frac=1, random_state=0).reset_index(drop=True)
+axion_zero_shot = axion_all.iloc[:500].reset_index(drop=True)
+
+kappa_ax_, source_ax_, image_ax_, axx_ax_, axy_ax_ = load_raw_channels(axion_zero_shot)
+K_axion, S_axion, I_axion, A_axion = build_tensor_dataset(kappa_ax_, source_ax_, image_ax_, axx_ax_, axy_ax_)
+print(K_axion.shape, I_axion.shape)
+
+axion_loader = torch.utils.data.DataLoader(
+    torch.utils.data.TensorDataset(K_axion, S_axion, I_axion, A_axion), batch_size=64, shuffle=False)
+
+ckpt = torch.load("best_deeponet.pt")
+model.load_state_dict(ckpt["model"])
+psf_blur.load_state_dict(ckpt["psf_blur"])
+model.eval()
+psf_blur.eval()
+
+axion_img, axion_alpha = 0, 0
+with torch.no_grad():
+    for kb, sb, ib, ab in axion_loader:
+        kb, sb, ib, ab = kb.to(device), sb.to(device), ib.to(device), ab.to(device)
+        _, image_loss, alpha_loss, _, _, _ = compute_losses(model, psf_blur, kb, sb, ib, ab, alpha_weight=5.0)
+        axion_img += image_loss.item() * kb.size(0)
+        axion_alpha += alpha_loss.item() * kb.size(0)
+axion_img /= len(K_axion); axion_alpha /= len(K_axion)
+
+print("WDM-trained model, zero-shot Axion | image rel_l2:", axion_img, "| alpha rel_l2:", axion_alpha)
+print("WDM-trained model, zero-shot CDM image rel_l2:", cdm_img)
+print("WDM-trained model, in-distribution WDM image rel_l2:", test_img)
+
+sample_indices = [0, 100, 300]
+for idx in sample_indices:
+    kb = K_axion[idx:idx+1].to(device)
+    sb = S_axion[idx:idx+1].to(device)
+    ib = I_axion[idx:idx+1].to(device)
+    ab = A_axion[idx:idx+1].to(device)
+    with torch.no_grad():
+        _, _, _, pred_image, alpha_pred, lens_light_pred = compute_losses(model, psf_blur, kb, sb, ib, ab, alpha_weight=5.0)
+
+    img_true = denormalize(ib[0].cpu(), image_mean, image_std).numpy()
+    img_pred = denormalize(pred_image[0].cpu(), image_mean, image_std).numpy()
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    axes[0].imshow(img_true, cmap="viridis"); axes[0].set_title(f"Axion true image (idx {idx})")
+    axes[1].imshow(img_pred, cmap="viridis"); axes[1].set_title("Axion predicted image")
+    axes[2].imshow(img_true - img_pred, cmap="coolwarm"); axes[2].set_title("Axion error")
+    plt.tight_layout()
+    plt.show()
